@@ -1,10 +1,14 @@
 module HsCabal
   ( listDirRec,
     listMod,
+    getModules,
     (^>=),
     (@@),
     anyVersionDep,
     unConditional,
+    warningOpt,
+    simpleBuildInfo,
+    addLibraryMod,
     LocalPackage (..),
     writeLocalPackage,
     simpleCabalProject,
@@ -12,14 +16,18 @@ module HsCabal
 where
 
 import Data.Foldable
+import Data.Functor
 import qualified Data.Set as S
 import Distribution.Client.ProjectConfig
+import Distribution.Compiler
 import Distribution.ModuleName
 import Distribution.Package
 import Distribution.PackageDescription
 import Distribution.PackageDescription.PrettyPrint
 import Distribution.Types.VersionRange
+import Distribution.Utils.Path
 import Distribution.Version
+import Language.Haskell.Extension
 import System.Directory
 import System.FilePath
 
@@ -48,12 +56,14 @@ listDirRec root =
               id
         else pure (S.insert p)
 
-listMod :: String -> FilePath -> IO (S.Set ModuleName)
-listMod ext d =
+getModules :: String -> S.Set FilePath -> S.Set ModuleName
+getModules ext =
   S.mapMonotonic
     (fromString . fmap (\c -> if c == '/' then '.' else c) . dropExtension)
     . S.filter (ext `isExtensionOf`)
-    <$> listDirRec d
+
+listMod :: String -> FilePath -> IO (S.Set ModuleName)
+listMod ext d = getModules ext <$> listDirRec d
 
 (^>=) :: PackageName -> [Int] -> Dependency
 d ^>= v =
@@ -67,6 +77,50 @@ d @@ v = mkDependency d v mainLibSet
 
 anyVersionDep :: PackageName -> Dependency
 anyVersionDep d = mkDependency d anyVersion mainLibSet
+
+warningOpt :: PerCompilerFlavor [String]
+warningOpt =
+  PerCompilerFlavor
+    [ "-Wall",
+      "-Wcompat",
+      "-Widentities",
+      "-Wincomplete-record-updates",
+      "-Wincomplete-uni-patterns",
+      "-Wmissing-export-lists",
+      "-Wmissing-home-modules",
+      "-Wpartial-fields",
+      "-Wredundant-constraints"
+    ]
+    []
+
+simpleBuildInfo :: FilePath -> PerCompilerFlavor [String] -> BuildInfo
+simpleBuildInfo src opt =
+  emptyBuildInfo
+    { hsSourceDirs = [unsafeMakeSymbolicPath src],
+      defaultLanguage = Just Haskell2010,
+      options = warningOpt <> opt
+    }
+
+addLibraryMod :: Library -> IO Library
+addLibraryMod lib = do
+  (mods, sigs) <-
+    traverse
+      (listDirRec . getSymbolicPath)
+      (hsSourceDirs (libBuildInfo lib))
+      <&> ( \cont ->
+              (getModules "hs" cont, getModules "hsig" cont)
+          )
+        . mconcat
+  pure
+    ( lib
+        { exposedModules =
+            S.toAscList
+              ( mods
+                  `S.difference` S.fromList (otherModules (libBuildInfo lib))
+              ),
+          signatures = S.toAscList sigs
+        }
+    )
 
 unConditional :: Monoid c => a -> CondTree v c a
 unConditional v =
